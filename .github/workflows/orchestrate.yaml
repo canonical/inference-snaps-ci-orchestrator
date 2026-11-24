@@ -1,0 +1,34 @@
+name: Orchestrate
+
+on:
+  # TODO: replace the timer with webhooks (repository_dispatch) sent by the snap repos
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only log the actions, without labelling or merging PRs
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Scan snap PRs, trigger tests and merge
+        env:
+          # Token with write access to the PRs of the snap repos
+          GITHUB_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          # Scheduled runs use the DRY_RUN repository variable
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) || vars.DRY_RUN }}
+        run: python3 orchestrator.py
