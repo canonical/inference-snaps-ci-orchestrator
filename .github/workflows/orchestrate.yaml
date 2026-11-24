@@ -1,7 +1,6 @@
 name: Orchestrate
 
 on:
-  # TODO: replace the timer with webhooks (repository_dispatch) sent by the snap repos
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -29,8 +28,6 @@ jobs:
         env:
           # Token with write access to the PRs of the snap repos
           GITHUB_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
-          # Scheduled runs use the DRY_RUN repository variable
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) || vars.DRY_RUN }}
-          # Regex of the lab test check name required to merge
-          REQUIRED_CHECK: ${{ vars.REQUIRED_CHECK }}
+          # Only an explicit false enables writes on scheduled runs.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) || vars.DRY_RUN || 'true' }}
         run: python3 orchestrator.py
