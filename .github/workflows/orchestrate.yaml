@@ -31,4 +31,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
           # Scheduled runs use the DRY_RUN repository variable
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) || vars.DRY_RUN }}
+          # Regex of the lab test check name required to merge
+          REQUIRED_CHECK: ${{ vars.REQUIRED_CHECK }}
         run: python3 orchestrator.py

@@ -8,8 +8,10 @@ On every run this script:
 3. For each PR opened by Renovate that changes a runtime dependency affecting
    inference (llama.cpp, OpenVINO, Intel compute runtime, drivers, ...):
    - adds the trigger label (which starts the lab tests in the snap repo),
-   - re-adds the label if new commits were pushed after it was added,
-   - merges the PR once all checks that started after labelling have passed.
+     recording the tested head SHA in a PR comment,
+   - re-adds the label if the head SHA changed since the tests were triggered,
+   - merges the PR once all checks have passed, including checks that
+     started after the tests were triggered.
 
 Only the Python standard library is used.
 """
@@ -39,6 +41,11 @@ RUNTIME_PATTERNS = {
     "intel-npu-driver": re.compile(r"npu-driver", re.IGNORECASE),
     "level-zero": re.compile(r"level-zero", re.IGNORECASE),
 }
+
+# Comment recording the head SHA for which the tests were triggered
+TRIGGER_MARKER = "<!-- inference-snaps-ci-orchestrator: tests triggered for {sha} -->\nTriggered lab tests for {sha}."
+TRIGGER_MARKER_RE = re.compile(r"<!-- inference-snaps-ci-orchestrator: tests triggered for ([0-9a-f]{40}) -->")
+TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 SUCCESSFUL_CONCLUSIONS = {"success", "neutral", "skipped"}
 
@@ -151,37 +158,30 @@ def runtime_dependencies(pr, files):
     )
 
 
-def label_state(timeline, label=TRIGGER_LABEL):
-    """Return (labelled_at, pushed_after_label) from the PR timeline.
+def last_trigger(comments):
+    """Return (sha, triggered_at) of the last tests trigger, or (None, None).
 
-    `labelled_at` is the time the label was last added, or None.
-    `pushed_after_label` tells if commits were pushed after that time.
+    Each trigger is recorded by a marker comment with the tested head SHA.
+    Only comments from repository members and bots are trusted.
     """
-    labelled_at = None
-    for event in timeline:
-        if event.get("event") == "labeled" and event["label"]["name"] == label:
-            labelled_at = max(filter(None, [labelled_at, parse_time(event["created_at"])]))
-    if labelled_at is None:
-        return None, False
-
-    for event in timeline:
-        if event.get("event") == "head_ref_force_pushed":
-            pushed_at = event.get("created_at")
-        elif event.get("event") == "committed":
-            pushed_at = (event.get("committer") or {}).get("date")
-        else:
-            continue
-        if pushed_at and parse_time(pushed_at) > labelled_at:
-            return labelled_at, True
-    return labelled_at, False
+    for comment in reversed(comments):
+        trusted = (
+            comment.get("author_association") in TRUSTED_ASSOCIATIONS
+            or (comment.get("user") or {}).get("type") == "Bot"
+        )
+        match = TRIGGER_MARKER_RE.search(comment.get("body") or "")
+        if trusted and match:
+            return match.group(1), parse_time(comment["created_at"])
+    return None, None
 
 
-def evaluate_tests(check_runs, combined_status, labelled_at):
+def evaluate_tests(check_runs, combined_status, triggered_at, required_check=None):
     """Decide whether the tests of a commit are PENDING, FAILED or PASSED.
 
     Tests have passed when every check run and commit status succeeded, and
-    at least one of them started after the label was added (i.e. the tests
-    triggered by the label have actually run).
+    the tests triggered by the label have actually run: at least one check
+    started after the trigger. If `required_check` (regex) is set, a check
+    run with a matching name must have started after the trigger.
     """
     statuses = combined_status.get("statuses") or []
     if any(run["status"] != "completed" for run in check_runs):
@@ -193,18 +193,28 @@ def evaluate_tests(check_runs, combined_status, labelled_at):
     if statuses and combined_status.get("state") != "success":
         return FAILED
 
+    def after_trigger(t):
+        return t and parse_time(t) >= triggered_at
+
+    if required_check:
+        pattern = re.compile(required_check)
+        if not any(pattern.search(run.get("name", "")) and after_trigger(run.get("started_at")) for run in check_runs):
+            return PENDING
+        return PASSED
+
     started = [run.get("started_at") for run in check_runs]
     started += [status.get("created_at") for status in statuses]
-    if not any(t and parse_time(t) >= labelled_at for t in started):
+    if not any(after_trigger(t) for t in started):
         return PENDING
     return PASSED
 
 
 class Orchestrator:
-    def __init__(self, github, dry_run=False, merge_method="squash"):
+    def __init__(self, github, dry_run=False, merge_method="squash", required_check=None):
         self.github = github
         self.dry_run = dry_run
         self.merge_method = merge_method
+        self.required_check = required_check
 
     def run(self, repos):
         errors = 0
@@ -239,23 +249,23 @@ class Orchestrator:
             return "skip-not-runtime"
         log.info("%s: %r changes runtime dependencies: %s", ref, pr["title"], ", ".join(dependencies))
 
+        sha = pr["head"]["sha"]
         labels = {label["name"] for label in pr.get("labels", [])}
-        timeline = self.github.get_all(f"/repos/{repo}/issues/{pr['number']}/timeline")
-        labelled_at, pushed_after_label = label_state(timeline)
+        comments = self.github.get_all(f"/repos/{repo}/issues/{pr['number']}/comments")
+        triggered_sha, triggered_at = last_trigger(comments)
 
-        if TRIGGER_LABEL not in labels or labelled_at is None:
-            self.add_label(repo, pr, ref)
+        if TRIGGER_LABEL not in labels:
+            self.trigger_tests(repo, pr, ref)
             return "label"
-        if pushed_after_label:
-            log.info("%s: new commits since tests were triggered, re-triggering", ref)
+        if triggered_sha != sha:
+            log.info("%s: tests were not triggered for %s, re-triggering", ref, sha)
             self.remove_label(repo, pr, ref)
-            self.add_label(repo, pr, ref)
+            self.trigger_tests(repo, pr, ref)
             return "relabel"
 
-        sha = pr["head"]["sha"]
         check_runs = self.github.get_all(f"/repos/{repo}/commits/{sha}/check-runs", key="check_runs")
         combined_status = self.github.get(f"/repos/{repo}/commits/{sha}/status")
-        result = evaluate_tests(check_runs, combined_status, labelled_at)
+        result = evaluate_tests(check_runs, combined_status, triggered_at, self.required_check)
         if result == PENDING:
             log.info("%s: waiting for tests on %s", ref, sha)
             return "wait"
@@ -270,6 +280,18 @@ class Orchestrator:
                 {"sha": sha, "merge_method": self.merge_method},
             )
         return "merge"
+
+    def trigger_tests(self, repo, pr, ref):
+        # The marker is posted before the label so that every check started
+        # by the label starts after the marker.
+        sha = pr["head"]["sha"]
+        log.info("%s: triggering tests for %s", ref, sha)
+        if not self.dry_run:
+            self.github.post(
+                f"/repos/{repo}/issues/{pr['number']}/comments",
+                {"body": TRIGGER_MARKER.format(sha=sha)},
+            )
+        self.add_label(repo, pr, ref)
 
     def add_label(self, repo, pr, ref):
         log.info("%s: adding %r label", ref, TRIGGER_LABEL)
@@ -294,6 +316,11 @@ def main(argv=None):
         help="only log the actions (default: $DRY_RUN == 'true')",
     )
     parser.add_argument("--merge-method", default="squash", choices=["merge", "squash", "rebase"])
+    parser.add_argument(
+        "--required-check",
+        default=os.environ.get("REQUIRED_CHECK") or None,
+        help="regex of the lab test check run name required to merge (default: $REQUIRED_CHECK)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -305,7 +332,7 @@ def main(argv=None):
 
     repos = args.repo or repos_from_catalog(fetch_catalog(args.catalog_url))
     log.info("Scanning %d repos%s", len(repos), " (dry run)" if args.dry_run else "")
-    errors = Orchestrator(GitHub(token), args.dry_run, args.merge_method).run(repos)
+    errors = Orchestrator(GitHub(token), args.dry_run, args.merge_method, args.required_check).run(repos)
     return 1 if errors else 0
 
 

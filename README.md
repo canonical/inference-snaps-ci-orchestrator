@@ -13,11 +13,13 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
    by the PR match one of the `RUNTIME_PATTERNS` (llama.cpp, OpenVINO / OVMS,
    Intel compute runtime, Intel NPU driver, Level Zero).
 3. Adds the `trigger-tests` label to the PR, which is expected to start the lab tests in
-   the snap repository. If commits are pushed after the label was added (e.g. Renovate
-   rebased the PR), the label is removed and re-added to re-run the tests.
+   the snap repository. Just before that, it posts a PR comment recording the head SHA
+   being tested. If the head SHA changes (e.g. Renovate rebased the PR), the label is
+   removed and re-added to re-run the tests.
 4. Merges the PR (squash, pinned to the tested head SHA) once all check runs and commit
-   statuses of the head commit have passed, and at least one of them started after the
-   label was added. If any check fails, the PR is left for a human to look at.
+   statuses of the head commit have passed, and the lab tests have run after the trigger:
+   a check run matching `REQUIRED_CHECK` if set, otherwise any check.
+   If any check fails, the PR is left for a human to look at.
 
 ### Setup
 
@@ -28,6 +30,9 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
   labels added with it would not trigger workflows.
 - `DRY_RUN` repository variable (optional): set to `true` to only log what scheduled runs
   would do. Manual runs have a `dry-run` input (enabled by default).
+- `REQUIRED_CHECK` repository variable (recommended): regex matching the name of the lab
+  test check run, e.g. `^lab-tests`. Without it, any check that started after the trigger
+  counts as the lab tests having run.
 
 ### Run locally
 
@@ -47,5 +52,7 @@ python3 -m unittest discover -s tests -v
   workflows may also be delayed or skipped by GitHub under load).
 - "All tests passed" is inferred from the checks of the head commit. If the lab tests
   never start after labelling, the PR waits forever.
+- The tests trigger relies on the snap repository running the lab tests when the
+  `trigger-tests` label is added.
 - Merging may be refused by branch protection (e.g. required reviews); the error is
   logged and the run fails.

@@ -29,22 +29,31 @@ def make_pr(number=1, author="renovate[bot]", title="Update dependency foo", lab
         "user": {"login": author},
         "draft": draft,
         "labels": [{"name": name} for name in labels],
-        "head": {"sha": "abc123"},
+        "head": {"sha": SHA},
     }
 
 
-def labelled(at=LABELLED_AT):
-    return {"event": "labeled", "label": {"name": "trigger-tests"}, "created_at": at}
+SHA = "a" * 40
+OTHER_SHA = "b" * 40
 
 
-def check_run(status="completed", conclusion="success", started_at=AFTER):
-    return {"status": status, "conclusion": conclusion, "started_at": started_at}
+def marker(sha=SHA, at=LABELLED_AT, association="MEMBER", user_type="User"):
+    return {
+        "body": orchestrator.TRIGGER_MARKER.format(sha=sha),
+        "created_at": at,
+        "author_association": association,
+        "user": {"type": user_type},
+    }
+
+
+def check_run(status="completed", conclusion="success", started_at=AFTER, name="build"):
+    return {"name": name, "status": status, "conclusion": conclusion, "started_at": started_at}
 
 
 class FakeGitHub:
-    def __init__(self, files=(), timeline=(), check_runs=(), status=None):
+    def __init__(self, files=(), comments=(), check_runs=(), status=None):
         self.files = list(files)
-        self.timeline = list(timeline)
+        self.comments = list(comments)
         self.check_runs = list(check_runs)
         self.status = status or {"state": "pending", "statuses": []}
         self.calls = []
@@ -52,8 +61,8 @@ class FakeGitHub:
     def get_all(self, path, key=None):
         if path.endswith("/files"):
             return self.files
-        if path.endswith("/timeline"):
-            return self.timeline
+        if path.endswith("/comments"):
+            return self.comments
         if path.endswith("/check-runs"):
             return self.check_runs
         raise AssertionError(path)
@@ -113,36 +122,31 @@ class TestRuntimeDependencies(unittest.TestCase):
         self.assertEqual(orchestrator.runtime_dependencies(pr, files), [])
 
 
-class TestLabelState(unittest.TestCase):
-    def test_not_labelled(self):
-        self.assertEqual(orchestrator.label_state([]), (None, False))
+class TestLastTrigger(unittest.TestCase):
+    def test_no_trigger(self):
+        self.assertEqual(orchestrator.last_trigger([{"body": "hello", "author_association": "MEMBER"}]), (None, None))
 
-    def test_uses_latest_label_event(self):
-        timeline = [labelled(BEFORE), labelled(LABELLED_AT)]
+    def test_uses_latest_marker(self):
+        comments = [marker(OTHER_SHA, BEFORE), marker(SHA, LABELLED_AT), {"body": "hi", "created_at": AFTER}]
         self.assertEqual(
-            orchestrator.label_state(timeline),
-            (datetime(2026, 11, 20, 10, tzinfo=timezone.utc), False),
+            orchestrator.last_trigger(comments),
+            (SHA, datetime(2026, 11, 20, 10, tzinfo=timezone.utc)),
         )
 
-    def test_force_push_after_label(self):
-        timeline = [labelled(), {"event": "head_ref_force_pushed", "created_at": AFTER}]
-        self.assertTrue(orchestrator.label_state(timeline)[1])
+    def test_trusts_bots(self):
+        self.assertEqual(orchestrator.last_trigger([marker(association="NONE", user_type="Bot")])[0], SHA)
 
-    def test_commit_after_label(self):
-        timeline = [labelled(), {"event": "committed", "committer": {"date": AFTER}}]
-        self.assertTrue(orchestrator.label_state(timeline)[1])
-
-    def test_push_before_label(self):
-        timeline = [{"event": "head_ref_force_pushed", "created_at": BEFORE}, labelled()]
-        self.assertFalse(orchestrator.label_state(timeline)[1])
+    def test_ignores_untrusted_authors(self):
+        comments = [marker(OTHER_SHA, BEFORE), marker(SHA, AFTER, association="NONE")]
+        self.assertEqual(orchestrator.last_trigger(comments)[0], OTHER_SHA)
 
 
 class TestEvaluateTests(unittest.TestCase):
     labelled_at = orchestrator.parse_time(LABELLED_AT)
     no_status = {"state": "pending", "statuses": []}
 
-    def evaluate(self, check_runs, status=None):
-        return orchestrator.evaluate_tests(check_runs, status or self.no_status, self.labelled_at)
+    def evaluate(self, check_runs, status=None, required_check=None):
+        return orchestrator.evaluate_tests(check_runs, status or self.no_status, self.labelled_at, required_check)
 
     def test_passed(self):
         self.assertEqual(self.evaluate([check_run(), check_run(conclusion="skipped")]), PASSED)
@@ -158,6 +162,13 @@ class TestEvaluateTests(unittest.TestCase):
 
     def test_no_checks(self):
         self.assertEqual(self.evaluate([]), PENDING)
+
+    def test_required_check(self):
+        runs = [check_run(name="build"), check_run(name="lab-tests / gpu", started_at=BEFORE)]
+        self.assertEqual(self.evaluate(runs, required_check=r"^lab-tests"), PENDING)
+        runs = [check_run(name="build"), check_run(name="lab-tests / gpu")]
+        self.assertEqual(self.evaluate(runs, required_check=r"^lab-tests"), PASSED)
+        self.assertEqual(self.evaluate([check_run(name="build")], required_check=r"^lab-tests"), PENDING)
 
     def test_statuses(self):
         status = {"state": "success", "statuses": [{"state": "success", "created_at": AFTER}]}
@@ -193,7 +204,10 @@ class TestProcess(unittest.TestCase):
         self.assertEqual(self.process(github, make_pr()), "label")
         self.assertEqual(
             github.calls,
-            [("POST", "/repos/canonical/foo-snap/issues/1/labels", {"labels": ["trigger-tests"]})],
+            [
+                ("POST", "/repos/canonical/foo-snap/issues/1/comments", {"body": orchestrator.TRIGGER_MARKER.format(sha=SHA)}),
+                ("POST", "/repos/canonical/foo-snap/issues/1/labels", {"labels": ["trigger-tests"]}),
+            ],
         )
 
     def test_dry_run(self):
@@ -202,18 +216,20 @@ class TestProcess(unittest.TestCase):
         self.assertEqual(github.calls, [])
 
     def test_relabels_after_push(self):
-        github = FakeGitHub(
-            files=self.runtime_files,
-            timeline=[labelled(), {"event": "head_ref_force_pushed", "created_at": AFTER}],
-        )
+        github = FakeGitHub(files=self.runtime_files, comments=[marker(OTHER_SHA)], check_runs=[check_run()])
         self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "relabel")
-        self.assertEqual([call[0] for call in github.calls], ["DELETE", "POST"])
+        self.assertEqual([call[0] for call in github.calls], ["DELETE", "POST", "POST"])
         self.assertEqual(github.calls[0][1], "/repos/canonical/foo-snap/issues/1/labels/trigger-tests")
+        self.assertIn(SHA, github.calls[1][2]["body"])
+
+    def test_relabels_without_marker(self):
+        github = FakeGitHub(files=self.runtime_files, check_runs=[check_run()])
+        self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "relabel")
 
     def test_waits(self):
         github = FakeGitHub(
             files=self.runtime_files,
-            timeline=[labelled()],
+            comments=[marker()],
             check_runs=[check_run(status="queued", conclusion=None)],
         )
         self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "wait")
@@ -222,7 +238,7 @@ class TestProcess(unittest.TestCase):
     def test_failed(self):
         github = FakeGitHub(
             files=self.runtime_files,
-            timeline=[labelled()],
+            comments=[marker()],
             check_runs=[check_run(conclusion="failure")],
         )
         self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "failed")
@@ -231,13 +247,13 @@ class TestProcess(unittest.TestCase):
     def test_merges(self):
         github = FakeGitHub(
             files=self.runtime_files,
-            timeline=[labelled()],
+            comments=[marker()],
             check_runs=[check_run()],
         )
         self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "merge")
         self.assertEqual(
             github.calls,
-            [("PUT", "/repos/canonical/foo-snap/pulls/1/merge", {"sha": "abc123", "merge_method": "squash"})],
+            [("PUT", "/repos/canonical/foo-snap/pulls/1/merge", {"sha": SHA, "merge_method": "squash"})],
         )
 
 
