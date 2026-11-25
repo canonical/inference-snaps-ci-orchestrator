@@ -172,9 +172,48 @@ class TestRuntimeDependencies(unittest.TestCase):
                 files = [{"filename": "snap/snapcraft.yaml", "patch": f"+    source: https://github.com/{url}/v2"}]
                 self.assertEqual(orchestrator.runtime_dependencies(files), [expected])
 
+    def test_renovate_llamacpp_release_updates(self):
+        release = "https://github.com/canonical/llama.cpp-builds/releases/download"
+        for field, asset in [
+            ("- on amd64", "llamacpp-amd64.tar.gz"),
+            ("- on arm64", "llamacpp-arm64.tar.gz"),
+            ("- on amd64", "llamacpp-amd64+cuda12.tar.gz"),
+            ("- on arm64", "llamacpp-arm64+cuda12.tar.gz"),
+            ("- on amd64", "llamacpp-amd64+cuda12.9.tar.gz"),
+            ("- on arm64", "llamacpp-arm64+cuda12.9.tar.gz"),
+            ("- on amd64", "llamacpp-amd64+rocm.tar.gz"),
+            ("source", "llamacpp-amd64+rocm.tar.gz"),
+            ("source", "llamacpp-amd64+onemkl.tar.gz"),
+        ]:
+            with self.subTest(field=field, asset=asset):
+                diff = f"-      {field}: {release}/v0.5.0/{asset}\n+      {field}: {release}/v0.6.0/{asset}"
+                files = [{"filename": "snap/snapcraft.yaml", "patch": diff}]
+                self.assertEqual(orchestrator.runtime_dependencies(files), ["llama.cpp"])
+
+    def test_renovate_openvino_release_update(self):
+        release = "https://github.com/openvinotoolkit/model_server/releases/download"
+        asset = "ovms_ubuntu24_2026.2.0_python_off.tar.gz"
+        diff = f"-    source: {release}/v2026.2/{asset}\n+    source: {release}/v2026.2.1/{asset}"
+        files = [{"filename": "snap/snapcraft.yaml", "patch": diff}]
+        self.assertEqual(orchestrator.runtime_dependencies(files), ["openvino"])
+
     def test_source_tag_with_unchanged_runtime_source(self):
-        files = [{"filename": "snap/snapcraft.yaml", "patch": TAG_PATCH}]
-        self.assertEqual(orchestrator.runtime_dependencies(files), ["intel-compute-runtime"])
+        for part in ("cli-intel-opencl-icd", "intel-opencl-icd", "intel-compute-runtime"):
+            with self.subTest(part=part):
+                diff = TAG_PATCH.replace("cli-intel-opencl-icd", part)
+                files = [{"filename": "snap/snapcraft.yaml", "patch": diff}]
+                self.assertEqual(orchestrator.runtime_dependencies(files), ["intel-compute-runtime"])
+
+    def test_ignores_renovate_modelctl_and_webui_release_updates(self):
+        for package, asset in [
+            ("inference-snaps", "modelctl-linux-amd64.tar.xz"),
+            ("inference-snaps-webui", "inference-snaps-webui.tar.xz"),
+        ]:
+            with self.subTest(package=package):
+                release = f"https://github.com/canonical/{package}/releases/download"
+                diff = f"-    source: {release}/v1.0.0/{asset}\n+    source: {release}/v1.1.0/{asset}"
+                files = [{"filename": "snap/snapcraft.yaml", "patch": diff}]
+                self.assertEqual(orchestrator.runtime_dependencies(files), [])
 
     def test_ignores_unrelated_context_and_missing_patch(self):
         files = [{"filename": "snap/snapcraft.yaml", "patch": OTHER_PATCH}]
