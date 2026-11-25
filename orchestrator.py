@@ -35,24 +35,11 @@ LAB_JOB_RE = re.compile(r"^trigger-tests / test(?: \(| /|$)")
 
 # Matched only against changes in snapcraft.yaml.
 RUNTIME_PATTERNS = {
-    "llama.cpp": re.compile(r"\bllama[.-]?cpp|\bllama[-_]aio(?![a-z0-9])", re.IGNORECASE),
+    "llama.cpp": re.compile(r"llama\.?cpp", re.IGNORECASE),
     "openvino": re.compile(r"openvino|model_server|\bovms", re.IGNORECASE),
-    "intel-compute-runtime": re.compile(
-        r"\b(?:compute-runtime|intel-opencl-icd|intel-graphics-compiler|intel-igc-|intel-ocloc|libigdgmm)",
-        re.IGNORECASE,
-    ),
-    "intel-npu-driver": re.compile(
-        r"\b(?:npu-driver|intel-npu-device|npu-libs)\b|^\s*(?:-\s+)?intel-npu(?=[:\s]|$)",
-        re.IGNORECASE,
-    ),
-    "level-zero": re.compile(r"\b(?:level-zero|libze-intel-gpu1)(?![a-z0-9])", re.IGNORECASE),
-    "mediatek-llm-proxy": re.compile(r"\bmediatek-llm-proxy\b", re.IGNORECASE),
-    "mediatek-npu": re.compile(r"\bmediatek-(?:npu-2404|accel)\b", re.IGNORECASE),
-    "nvidia-cuda": re.compile(
-        r"\b(?:nvidia-l4t-cuda|cuda-cudart|cuda-nvcc|libcublas)\b|repo\.download\.nvidia\.com/jetson/",
-        re.IGNORECASE,
-    ),
-    "vulkan": re.compile(r"\b(?:gpu-snap|gpu-2404|libvulkan(?:1|-dev))\b", re.IGNORECASE),
+    "intel-compute-runtime": re.compile(r"compute-runtime", re.IGNORECASE),
+    "intel-npu-driver": re.compile(r"npu-driver", re.IGNORECASE),
+    "level-zero": re.compile(r"level-zero", re.IGNORECASE),
 }
 
 # Comment recording the head SHA for which the tests were triggered

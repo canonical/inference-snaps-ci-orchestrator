@@ -10,12 +10,11 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
    and lists the open PRs of each snap repository (`repo_url`).
 2. Selects non-draft PRs authored by `renovate[bot]` that change a runtime dependency
    affecting inference. Only changed lines in `snap/snapcraft.yaml` or `snapcraft.yaml`
-   are matched against `RUNTIME_PATTERNS`: llama.cpp (including Ampere builds),
-   OpenVINO / OVMS, Intel compute runtime and Level Zero, Intel NPU content,
-   MediaTek's LLM proxy and NPU content, Jetson CUDA packages, and Vulkan GPU
-   support. A changed `source-tag` also uses its immediately preceding, unchanged
-   `source` URL. PR titles and other files are ignored; updates made only on the
-   host or in a separate content snap are not visible here.
+   are matched against `RUNTIME_PATTERNS`. The shared Renovate config currently
+   updates three inference dependencies: Canonical's llama.cpp build archives,
+   OpenVINO Model Server release archives, and tags for the Intel compute runtime
+   bundle. For a `source-tag` update, the matcher also checks the immediately
+   preceding, unchanged `source` URL. PR titles and other files are ignored.
 3. Records one trigger attempt per head SHA in a PR comment, then adds `trigger-tests`.
    An already-present label is removed first so that the addition fires an event.
    The shared workflow consumes the label; its absence does **not** cause another attempt.
