@@ -51,9 +51,9 @@ or `completed`) separately from the **Orchestrator state** (for example, `pendin
 ### Run locally
 
 ```shell
-GITHUB_TOKEN=... python3 orchestrator.py --repo canonical/deepseek-r1-snap
+GITHUB_TOKEN="$(gh auth token)" python3 orchestrator.py --repo canonical/deepseek-r1-snap
 # Explicitly enable writes:
-GITHUB_TOKEN=... python3 orchestrator.py --apply --repo canonical/deepseek-r1-snap
+GITHUB_TOKEN="$(gh auth token)" python3 orchestrator.py --apply --repo canonical/deepseek-r1-snap
 ```
 
 ### Known limitations

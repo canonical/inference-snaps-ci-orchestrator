@@ -190,7 +190,7 @@ class Trigger:
 
 
 def find_trigger(comments, sha):
-    """Find the attempt for this SHA, including markers from the older format."""
+    """Find the recorded attempt for this SHA."""
     for comment in reversed(comments):
         trusted = (
             comment.get("author_association") in TRUSTED_ASSOCIATIONS
@@ -199,15 +199,17 @@ def find_trigger(comments, sha):
         match = TRIGGER_MARKER_RE.search(comment.get("body") or "")
         if trusted and match and match.group(1) == sha:
             metadata = TRIGGER_STATE_RE.search(comment["body"])
-            state = json.loads(metadata.group(1)) if metadata else {}
-            if not isinstance(state, dict):
+            if metadata is None:
+                raise ValueError("Missing state in trigger comment")
+            state = json.loads(metadata.group(1))
+            if not isinstance(state, dict) or "run_id" not in state or not isinstance(state.get("state"), str):
                 raise ValueError("Invalid state in trigger comment")
-            run_id = state.get("run_id")
+            run_id = state["run_id"]
             if run_id is not None and (type(run_id) is not int or run_id <= 0):
                 raise ValueError("Invalid workflow run ID in trigger comment")
             return Trigger(
                 sha, comment["id"], parse_time(comment["created_at"]),
-                run_id, state.get("state", "waiting-for-run"), comment["body"],
+                run_id, state["state"], comment["body"],
             )
     return None
 
