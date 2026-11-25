@@ -212,13 +212,15 @@ def find_trigger(comments, sha):
     return None
 
 
-def trigger_body(sha, run_id=None, state="waiting-for-run"):
+def trigger_body(repo, sha, run_id=None, state="waiting-for-run", workflow_state=None):
     metadata = json.dumps({"run_id": run_id, "state": state}, sort_keys=True)
+    run_link = f"[{run_id}](https://github.com/{repo}/actions/runs/{run_id})" if run_id is not None else "not linked yet"
     return (
         TRIGGER_MARKER.format(sha=sha)
         + f"\n<!-- inference-snaps-ci-orchestrator: state {metadata} -->"
-        + f"\nWorkflow run: {run_id if run_id is not None else 'not linked yet'}."
-        + f"\nState: {state}."
+        + f"\nWorkflow run: {run_link}."
+        + (f"\nWorkflow state: {workflow_state}." if workflow_state is not None else "")
+        + f"\nOrchestrator state: {state}."
     )
 
 
@@ -325,6 +327,7 @@ class Orchestrator:
             self.update_trigger(repo, trigger, "invalid-run")
             return "failed"
         result = evaluate_lab_run(run, self.run_jobs(repo, run))
+        state = result
         if result == PASSED:
             # Old label events have different job names and may be cancelled.
             # The bound run above is the sole authority for this workflow.
@@ -334,6 +337,7 @@ class Orchestrator:
             checks = [check for check in check_runs if check["check_suite"]["id"] not in label_suites]
             statuses = self.github.get_all(f"/repos/{repo}/commits/{sha}/status", key="statuses")
             result = evaluate_checks(checks, statuses)
+            state = "waiting-for-checks" if result == PENDING else result
             if result == PASSED:
                 latest = self.github.get(f"/repos/{repo}/actions/runs/{trigger.run_id}")
                 if (
@@ -343,12 +347,14 @@ class Orchestrator:
                 ):
                     log.info("%s: linked run changed during evaluation; waiting for the next poll", ref)
                     result = PENDING
-        self.update_trigger(repo, trigger, result)
+                    state = result
+                    run = latest
+        self.update_trigger(repo, trigger, state, run["status"])
         if result != PASSED:
             if result == FAILED:
                 log.warning("%s: run %s or commit checks failed; needs triage", ref, trigger.run_id)
                 return "failed"
-            log.info("%s: waiting for run %s or commit checks", ref, trigger.run_id)
+            log.info("%s: %s (run %s)", ref, state, trigger.run_id)
             return "wait"
 
         log.info("%s: tests passed on %s, merging", ref, sha)
@@ -359,7 +365,7 @@ class Orchestrator:
             )
             if not response.get("merged"):
                 raise ValueError(f"Merge refused: {response.get('message')}")
-            self.update_trigger(repo, trigger, "merged")
+            self.update_trigger(repo, trigger, "merged", run["status"])
         return "merge"
 
     @staticmethod
@@ -382,8 +388,8 @@ class Orchestrator:
             key="jobs",
         )
 
-    def update_trigger(self, repo, trigger, state):
-        body = trigger_body(trigger.sha, trigger.run_id, state)
+    def update_trigger(self, repo, trigger, state, workflow_state=None):
+        body = trigger_body(repo, trigger.sha, trigger.run_id, state, workflow_state)
         if body != trigger.body and not self.dry_run:
             self.github.patch(
                 f"/repos/{repo}/issues/comments/{trigger.comment_id}", {"body": body},
@@ -399,7 +405,7 @@ class Orchestrator:
             # must not cause another automatic attempt on the next poll.
             self.github.post(
                 f"/repos/{repo}/issues/{pr['number']}/comments",
-                {"body": trigger_body(sha)},
+                {"body": trigger_body(repo, sha)},
             )
         labels = {label["name"] for label in pr.get("labels", [])}
         if TRIGGER_LABEL in labels:

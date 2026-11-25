@@ -18,7 +18,7 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
    The shared workflow consumes the label; its absence does **not** cause another attempt.
 4. Finds the matching `.github/workflows/pr-label.yaml` run using the SHA, head branch,
    PR association when available, creation time and `trigger-tests / ` job names.
-   It updates the same comment with the run ID and subsequent state. Multiple possible
+   It updates the same comment with a clickable run ID and subsequent state. Multiple possible
    runs are left for triage rather than guessing. Each SHA keeps its own comment, so
    returning to an older SHA does not cause another attempt.
 5. Waits for the linked workflow to complete successfully. It requires a nonempty lab
@@ -28,6 +28,10 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
 6. Merges the PR (squash, pinned to the tested SHA) after the remaining head-commit
    checks and statuses pass. Historical `PR Label` runs are excluded from this extra
    gate: the linked run is the authority for lab results. Branch protection still applies.
+
+Comments show GitHub's raw **Workflow state** (for example, `queued`, `in_progress`,
+or `completed`) separately from the **Orchestrator state** (for example, `pending`,
+`waiting-for-checks`, or `merged`). States are refreshed on each poll.
 
 ### Setup
 
@@ -50,12 +54,6 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
 GITHUB_TOKEN=... python3 orchestrator.py --repo canonical/deepseek-r1-snap
 # Explicitly enable writes:
 GITHUB_TOKEN=... python3 orchestrator.py --apply --repo canonical/deepseek-r1-snap
-```
-
-### Tests
-
-```shell
-python3 -m unittest discover -s tests -v
 ```
 
 ### Known limitations
