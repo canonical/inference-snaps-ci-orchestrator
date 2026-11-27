@@ -615,6 +615,29 @@ class TestProcess(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
+    def test_actions_run_url_uses_workflow_repository_and_requires_actions_context(self):
+        env = {
+            "GITHUB_SERVER_URL": "https://github.example.com/",
+            "GITHUB_REPOSITORY": "canonical/inference-snaps-ci-orchestrator",
+            "GITHUB_RUN_ID": "12345",
+        }
+        self.assertIsNone(orchestrator.actions_run_url(env))
+        env["GITHUB_ACTIONS"] = "true"
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": "test-token", **env}, clear=True),
+            patch.object(orchestrator, "Orchestrator") as cls,
+            patch.object(orchestrator.logging, "basicConfig"),
+        ):
+            cls.return_value.run.return_value = 0
+            self.assertEqual(orchestrator.main(["--repo", REPO]), 0)
+            self.assertEqual(
+                cls.call_args.kwargs["orchestrator_run_url"],
+                "https://github.example.com/canonical/inference-snaps-ci-orchestrator/actions/runs/12345",
+            )
+        del env["GITHUB_RUN_ID"]
+        with self.assertLogs("orchestrator", level="WARNING"):
+            self.assertIsNone(orchestrator.actions_run_url(env))
+
     def test_safe_defaults_and_explicit_execution(self):
         for value, flags, expected in [
             (None, [], True), ("", [], True), ("true", [], True), ("typo", [], True),

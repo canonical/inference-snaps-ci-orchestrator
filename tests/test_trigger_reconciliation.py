@@ -116,6 +116,30 @@ class TriggerReconciliationTests(unittest.TestCase):
         self.assertEqual(self.state().state, "waiting-for-run")
         self.assertEqual(self.github.post.call_count, 2)
 
+    def test_orchestrator_log_link_is_created_refreshed_and_omitted_locally(self):
+        run_base = "https://github.com/canonical/inference-snaps-ci-orchestrator/actions/runs/"
+        self.orchestrator.orchestrator_run_url = run_base + "1001"
+        self.assertEqual(self.poll(), "label")
+        for body in (self.github.post.call_args_list[0].args[1]["body"], self.comment["body"]):
+            self.assertIn(f"\nOrchestrator logs: [View run]({run_base}1001).", body)
+
+        self.orchestrator.orchestrator_run_url = run_base + "1002"
+        self.assertEqual(self.poll(), "wait")
+        self.assertEqual(self.state().state, "waiting-for-run")
+        self.assertIn(f"\nOrchestrator logs: [View run]({run_base}1002).", self.comment["body"])
+        self.assertNotIn(run_base + "1001", self.comment["body"])
+
+        self.runs.append(self.run_record())
+        self.jobs = [{"name": "trigger-tests / test (cpu)"}]
+        self.assertEqual(self.poll(), "wait")
+        self.assertIn(f"https://github.com/{self.repo}/actions/runs/42", self.comment["body"])
+        self.assertIn(run_base + "1002", self.comment["body"])
+
+        self.orchestrator.orchestrator_run_url = None
+        self.assertEqual(self.poll(), "wait")
+        self.assertNotIn("Orchestrator logs:", self.comment["body"])
+        self.assertIn(f"https://github.com/{self.repo}/actions/runs/42", self.comment["body"])
+
     def old_comment(self, node_id, **overrides):
         return {
             "id": 99, "node_id": node_id, "author_association": "MEMBER",
@@ -280,6 +304,7 @@ class TriggerReconciliationTests(unittest.TestCase):
     def test_dry_run_does_not_mutate_existing_intent(self):
         self.save_comment(orch.trigger_body(self.repo, self.sha))
         self.orchestrator.dry_run = True
+        self.orchestrator.orchestrator_run_url = "https://github.com/canonical/orchestrator/actions/runs/1001"
         self.assertEqual(self.poll(), "label")
         self.assertEqual(self.state().state, "ready-to-label")
         self.github.post.assert_not_called()
