@@ -1,0 +1,33 @@
+name: Orchestrate
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only log the actions, without labelling or merging PRs
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Scan snap PRs, trigger tests and merge
+        env:
+          # Token with write access to the PRs of the snap repos
+          GITHUB_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          # Only an explicit false enables writes on scheduled runs.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) || vars.DRY_RUN || 'true' }}
+        run: python3 orchestrator.py
