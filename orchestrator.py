@@ -7,7 +7,7 @@ On every run this script:
 2. Lists the open pull requests of each snap repository.
 3. For each PR opened by Renovate that changes a runtime dependency affecting
    inference (llama.cpp, OpenVINO, Intel compute runtime, drivers, ...):
-   - attempts the trigger label once per head SHA, recording it in a PR comment,
+   - reconciles delivery of the trigger label per head SHA using a PR comment,
    - updates that comment with the associated workflow run and its outcome,
    - merges the tested SHA only after the lab workflow and other checks pass.
 
@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 CATALOG_URL = "https://canonical.github.io/inference-snaps-admin/onboarded-snaps.json"
 GITHUB_API_URL = "https://api.github.com"
@@ -32,6 +32,9 @@ TRIGGER_LABEL = "trigger-tests"
 RENOVATE_AUTHORS = {"renovate[bot]"}
 LAB_WORKFLOW = ".github/workflows/pr-label.yaml"
 LAB_JOB_RE = re.compile(r"^trigger-tests / test(?: \(| /|$)")
+MAX_LABEL_ATTEMPTS = 3
+LABEL_RETRY_GRACE = timedelta(minutes=5)
+RUN_DISCOVERY_TIMEOUT = timedelta(minutes=30)
 
 # Matched only against changes in snapcraft.yaml.
 RUNTIME_PATTERNS = {
@@ -102,6 +105,13 @@ class GitHub:
     def post(self, path, body):
         return self._request("POST", path, body)[0]
 
+    def graphql(self, query, variables):
+        response = self.post("/graphql", {"query": query, "variables": variables})
+        if response.get("errors"):
+            messages = "; ".join(error["message"] for error in response["errors"])
+            raise ValueError(f"GitHub GraphQL: {messages}")
+        return response["data"]
+
     def put(self, path, body):
         return self._request("PUT", path, body)[0]
 
@@ -122,6 +132,12 @@ def _next_link(link_header):
 
 def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def uncertain_write(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 408 or 500 <= error.code < 600
+    return True  # A transport failure may happen after GitHub applied the write.
 
 
 def fetch_catalog(url=CATALOG_URL):
@@ -185,19 +201,24 @@ class Trigger:
     comment_id: int
     triggered_at: datetime
     run_id: int | None = None
-    state: str = "waiting-for-run"
+    state: str = "ready-to-label"
     body: str = ""
+    label_attempts: int = 0
+    label_requested_at: datetime | None = None
+
+
+def trusted_comment(comment):
+    return (
+        comment.get("author_association") in TRUSTED_ASSOCIATIONS
+        or (comment.get("user") or {}).get("type") == "Bot"
+    )
 
 
 def find_trigger(comments, sha):
     """Find the recorded attempt for this SHA."""
     for comment in reversed(comments):
-        trusted = (
-            comment.get("author_association") in TRUSTED_ASSOCIATIONS
-            or (comment.get("user") or {}).get("type") == "Bot"
-        )
         match = TRIGGER_MARKER_RE.search(comment.get("body") or "")
-        if trusted and match and match.group(1) == sha:
+        if trusted_comment(comment) and match and match.group(1) == sha:
             metadata = TRIGGER_STATE_RE.search(comment["body"])
             if metadata is None:
                 raise ValueError("Missing state in trigger comment")
@@ -207,15 +228,35 @@ def find_trigger(comments, sha):
             run_id = state["run_id"]
             if run_id is not None and (type(run_id) is not int or run_id <= 0):
                 raise ValueError("Invalid workflow run ID in trigger comment")
-            return Trigger(
-                sha, comment["id"], parse_time(comment["created_at"]),
-                run_id, state["state"], comment["body"],
-            )
+            created_at = parse_time(comment["created_at"])
+            phase = state["state"]
+            attempts = state.get("label_attempts", 0)
+            requested_at = state.get("label_requested_at")
+            if (
+                type(attempts) is not int or attempts < 0
+                or (attempts == 0 and requested_at is not None)
+                or (attempts > 0 and not isinstance(requested_at, str))
+            ):
+                raise ValueError("Invalid label attempt in trigger comment")
+            if requested_at is not None:
+                requested_at = parse_time(requested_at)
+                if requested_at.tzinfo is None:
+                    raise ValueError("Missing timezone for label attempt in trigger comment")
+            elif "label_attempts" not in state and phase == "waiting-for-run" and run_id is None:
+                # Legacy comments did not distinguish recording intent from sending the label.
+                attempts, requested_at, phase = 1, created_at, "label-requested"
+            return Trigger(sha, comment["id"], created_at, run_id, phase, comment["body"], attempts, requested_at)
     return None
 
 
-def trigger_body(repo, sha, run_id=None, state="waiting-for-run", workflow_state=None):
-    metadata = json.dumps({"run_id": run_id, "state": state}, sort_keys=True)
+def trigger_body(repo, sha, run_id=None, state="ready-to-label", workflow_state=None,
+                 *, label_attempts=0, label_requested_at=None):
+    metadata = json.dumps({
+        "run_id": run_id,
+        "state": state,
+        "label_attempts": label_attempts,
+        "label_requested_at": label_requested_at.isoformat() if label_requested_at is not None else None,
+    }, sort_keys=True)
     run_link = f"[{run_id}](https://github.com/{repo}/actions/runs/{run_id})" if run_id is not None else "not linked yet"
     return (
         TRIGGER_MARKER.format(sha=sha)
@@ -268,14 +309,14 @@ class Orchestrator:
         for repo in repos:
             try:
                 pulls = self.github.get_all(f"/repos/{repo}/pulls?state=open")
-            except (urllib.error.URLError, ValueError) as e:
+            except (urllib.error.URLError, TimeoutError, ValueError) as e:
                 log.error("%s: failed to list PRs: %s", repo, e)
                 errors += 1
                 continue
             for pr in pulls:
                 try:
                     self.process(repo, pr)
-                except (urllib.error.URLError, ValueError) as e:
+                except (urllib.error.URLError, TimeoutError, ValueError) as e:
                     log.error("%s#%s: %s", repo, pr["number"], e)
                     errors += 1
         return errors
@@ -297,12 +338,16 @@ class Orchestrator:
         log.info("%s: %r changes runtime dependencies: %s", ref, pr["title"], ", ".join(dependencies))
 
         sha = pr["head"]["sha"]
-        comments = self.github.get_all(f"/repos/{repo}/issues/{pr['number']}/comments")
+        comments_path = f"/repos/{repo}/issues/{pr['number']}/comments"
+        comments = self.github.get_all(comments_path)
         trigger = find_trigger(comments, sha)
 
         if trigger is None:
-            self.trigger_tests(repo, pr, ref)
-            return "label"
+            if self.dry_run:
+                log.info("%s: would record a trigger and reconcile the label for %s", ref, sha)
+                return "label"
+            trigger = self.record_trigger(repo, comments_path, sha, ref)
+            self.minimize_outdated_comments(comments, sha, ref)
 
         runs = self.github.get_all(
             f"/repos/{repo}/actions/workflows/pr-label.yaml/runs?head_sha={sha}&event=pull_request",
@@ -310,16 +355,22 @@ class Orchestrator:
         )
         if trigger.run_id is None:
             candidates = []
+            jobs_pending = False
             for run in runs:
                 if self.matches_trigger(run, pr, trigger):
                     jobs = self.run_jobs(repo, run)
                     if any(job["name"].startswith("trigger-tests / ") for job in jobs):
                         candidates.append(run)
-            if len(candidates) != 1:
-                state = "waiting-for-run" if not candidates else "ambiguous-runs"
-                log.warning("%s: %s for %s; no automatic retry, needs triage", ref, state, sha)
-                self.update_trigger(repo, trigger, state)
+                    elif not jobs and run["status"] != "completed":
+                        jobs_pending = True
+            if len(candidates) > 1:
+                log.warning("%s: multiple matching test runs for %s; needs triage", ref, sha)
+                self.update_trigger(repo, trigger, "ambiguous-runs")
                 return "wait"
+            if trigger.state == "ambiguous-runs":
+                return "wait"  # A later listing with fewer runs does not resolve an earlier ambiguity.
+            if jobs_pending or not candidates:
+                return self.reconcile_label(repo, pr, ref, trigger, jobs_pending)
             trigger.run_id = candidates[0]["id"]
             self.update_trigger(repo, trigger, "linked")
 
@@ -391,7 +442,10 @@ class Orchestrator:
         )
 
     def update_trigger(self, repo, trigger, state, workflow_state=None):
-        body = trigger_body(repo, trigger.sha, trigger.run_id, state, workflow_state)
+        body = trigger_body(
+            repo, trigger.sha, trigger.run_id, state, workflow_state,
+            label_attempts=trigger.label_attempts, label_requested_at=trigger.label_requested_at,
+        )
         if body != trigger.body and not self.dry_run:
             self.github.patch(
                 f"/repos/{repo}/issues/comments/{trigger.comment_id}", {"body": body},
@@ -399,31 +453,135 @@ class Orchestrator:
         trigger.state = state
         trigger.body = body
 
-    def trigger_tests(self, repo, pr, ref):
-        sha = pr["head"]["sha"]
-        log.info("%s: triggering tests for %s", ref, sha)
-        if not self.dry_run:
-            # Persist before attempting the label: even a failed/uncertain request
-            # must not cause another automatic attempt on the next poll.
-            self.github.post(
-                f"/repos/{repo}/issues/{pr['number']}/comments",
-                {"body": trigger_body(repo, sha)},
-            )
-        labels = {label["name"] for label in pr.get("labels", [])}
-        if TRIGGER_LABEL in labels:
-            self.remove_label(repo, pr, ref)
-        self.add_label(repo, pr, ref)
+    def record_trigger(self, repo, comments_path, sha, ref):
+        log.info("%s: recording lab-test trigger for %s", ref, sha)
+        try:
+            comment = self.github.post(comments_path, {"body": trigger_body(repo, sha)})
+        except (urllib.error.URLError, TimeoutError) as error:
+            if not uncertain_write(error):
+                raise
+            log.warning("%s: trigger comment POST uncertain (%s); checking for the saved comment", ref, error)
+            trigger = find_trigger(self.github.get_all(comments_path), sha)
+            if trigger is None:
+                raise
+            return trigger
+        return Trigger(sha, comment["id"], parse_time(comment["created_at"]), body=comment["body"])
 
-    def add_label(self, repo, pr, ref):
-        log.info("%s: adding %r label", ref, TRIGGER_LABEL)
-        if not self.dry_run:
-            self.github.post(f"/repos/{repo}/issues/{pr['number']}/labels", {"labels": [TRIGGER_LABEL]})
+    def minimize_outdated_comments(self, comments, sha, ref):
+        node_ids = []
+        for comment in comments:
+            body = comment.get("body") or ""
+            match = TRIGGER_MARKER_RE.match(body)
+            if not (trusted_comment(comment) and match and match.group(1) != sha):
+                continue
+            if not body.startswith(TRIGGER_MARKER.format(sha=match.group(1))) or not TRIGGER_STATE_RE.search(body):
+                continue
+            if not comment.get("node_id"):
+                log.warning("%s: cannot minimize comment %s: missing GraphQL node ID", ref, comment["id"])
+                continue
+            node_ids.append(comment["node_id"])
 
-    def remove_label(self, repo, pr, ref):
-        log.info("%s: removing %r label", ref, TRIGGER_LABEL)
-        if not self.dry_run:
-            label = urllib.parse.quote(TRIGGER_LABEL, safe="")
-            self.github.delete(f"/repos/{repo}/issues/{pr['number']}/labels/{label}")
+        for offset in range(0, len(node_ids), 100):
+            batch = node_ids[offset:offset + 100]
+            try:
+                data = self.github.graphql(
+                    """query($ids: [ID!]!) {
+                        nodes(ids: $ids) { ... on IssueComment { isMinimized viewerCanMinimize } }
+                    }""",
+                    {"ids": batch},
+                )
+            except (urllib.error.URLError, TimeoutError, ValueError) as error:
+                log.warning("%s: could not read older comment visibility: %s", ref, error)
+                continue
+            for node_id, node in zip(batch, data["nodes"]):
+                if node and node["isMinimized"]:
+                    continue
+                if not node or not node["viewerCanMinimize"]:
+                    log.warning("%s: cannot minimize comment %s with this token", ref, node_id)
+                    continue
+                try:
+                    data = self.github.graphql(
+                        """mutation($id: ID!) {
+                            minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+                                minimizedComment { isMinimized }
+                            }
+                        }""",
+                        {"id": node_id},
+                    )
+                    if not data["minimizeComment"]["minimizedComment"]["isMinimized"]:
+                        raise ValueError("GitHub did not minimize the comment")
+                except (urllib.error.URLError, TimeoutError, ValueError) as error:
+                    log.warning("%s: could not minimize comment %s: %s", ref, node_id, error)
+
+    def reconcile_label(self, repo, pr, ref, trigger, jobs_pending):
+        if trigger.state == "needs-triage":
+            return "wait"  # Still look for a matching run on later polls, but never write another label.
+
+        now = datetime.now(timezone.utc)
+        age = now - (trigger.label_requested_at or trigger.triggered_at)
+        if trigger.state == "waiting-for-run":
+            # Delivery was already confirmed; even add-then-remove is not a reason to retry.
+            if age >= RUN_DISCOVERY_TIMEOUT:
+                return self.label_triage(repo, trigger, ref, "label delivered but no unique test run found")
+            log.info("%s: label delivered; waiting for test run", ref)
+            return "wait"
+
+        issue_path = f"/repos/{repo}/issues/{pr['number']}"
+        events = self.github.get_all(f"{issue_path}/timeline")
+        # Use the first intent as the lower bound so a late event from any attempt blocks retries.
+        label_events = {
+            event["event"] for event in events
+            if event["event"] in {"labeled", "unlabeled"}
+            and event["label"]["name"] == TRIGGER_LABEL
+            and parse_time(event["created_at"]) >= trigger.triggered_at
+        }
+        if "labeled" in label_events:
+            if age >= RUN_DISCOVERY_TIMEOUT:
+                return self.label_triage(repo, trigger, ref, "label delivered but no unique test run found")
+            self.update_trigger(repo, trigger, "waiting-for-run")
+            log.info("%s: observed label addition; waiting for test run", ref)
+            return "wait"
+
+        current = self.github.get(f"/repos/{repo}/pulls/{pr['number']}")
+        if current["head"]["sha"] != trigger.sha or current["state"] != "open" or current.get("draft"):
+            log.info("%s: PR changed since scan; not labeling %s", ref, trigger.sha)
+            return "wait"
+        label_present = any(label["name"] == TRIGGER_LABEL for label in current["labels"])
+        if jobs_pending or label_present or (trigger.label_attempts and "unlabeled" in label_events):
+            reason = "possible test run or label delivery cannot be confirmed"
+            if age >= RUN_DISCOVERY_TIMEOUT:
+                return self.label_triage(repo, trigger, ref, reason)
+            log.info("%s: %s; not relabeling yet", ref, reason)
+            return "wait"
+
+        if trigger.label_attempts:
+            grace = LABEL_RETRY_GRACE * 2 ** (min(trigger.label_attempts, MAX_LABEL_ATTEMPTS) - 1)
+            if age < grace:
+                log.info("%s: waiting to reconcile label attempt %s", ref, trigger.label_attempts)
+                return "wait"
+            if trigger.label_attempts >= MAX_LABEL_ATTEMPTS:
+                return self.label_triage(repo, trigger, ref, "label attempt limit reached")
+
+        log.info("%s: %s %r (attempt %s)", ref, "would add" if self.dry_run else "adding",
+                 TRIGGER_LABEL, trigger.label_attempts + 1)
+        if self.dry_run:
+            return "label"
+        trigger.label_attempts += 1
+        trigger.label_requested_at = datetime.now(timezone.utc)
+        self.update_trigger(repo, trigger, "label-requested")
+        try:
+            self.github.post(f"{issue_path}/labels", {"labels": [TRIGGER_LABEL]})
+        except (urllib.error.URLError, TimeoutError) as error:
+            if not uncertain_write(error):
+                self.label_triage(repo, trigger, ref, f"label request rejected: {error}")
+            raise
+        self.update_trigger(repo, trigger, "waiting-for-run")
+        return "label"
+
+    def label_triage(self, repo, trigger, ref, reason):
+        log.warning("%s: %s; needs triage", ref, reason)
+        self.update_trigger(repo, trigger, "needs-triage")
+        return "wait"
 
 
 def main(argv=None):
