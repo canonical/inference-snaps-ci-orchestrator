@@ -65,6 +65,12 @@ GITHUB_TOKEN="$(gh auth token)" python3 orchestrator.py --repo canonical/deepsee
 GITHUB_TOKEN="$(gh auth token)" python3 orchestrator.py --apply --repo canonical/deepseek-r1-snap
 ```
 
+### Tests
+
+```shell
+python3 -m unittest discover -s tests -v
+```
+
 ### Known limitations
 
 - The normal polling interval is 5 minutes; GitHub may delay or skip scheduled runs.
