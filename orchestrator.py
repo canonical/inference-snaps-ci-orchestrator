@@ -49,6 +49,7 @@ RUNTIME_PATTERNS = {
 TRIGGER_MARKER = "<!-- inference-snaps-ci-orchestrator: tests triggered for {sha} -->\nLab-test trigger attempt for {sha}."
 TRIGGER_MARKER_RE = re.compile(r"<!-- inference-snaps-ci-orchestrator: tests triggered for ([0-9a-f]{40}) -->")
 TRIGGER_STATE_RE = re.compile(r"<!-- inference-snaps-ci-orchestrator: state (.+) -->")
+ORCHESTRATOR_LOGS_RE = re.compile(r"\nOrchestrator logs: \[View run\]\([^\n]+\)\.$", re.MULTILINE)
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 SUCCESSFUL_CONCLUSIONS = {"success", "neutral", "skipped"}
@@ -249,8 +250,13 @@ def find_trigger(comments, sha):
     return None
 
 
+def with_orchestrator_logs(body, url):
+    body = ORCHESTRATOR_LOGS_RE.sub("", body)
+    return body + f"\nOrchestrator logs: [View run]({url})." if url else body
+
+
 def trigger_body(repo, sha, run_id=None, state="ready-to-label", workflow_state=None,
-                 *, label_attempts=0, label_requested_at=None):
+                 *, label_attempts=0, label_requested_at=None, orchestrator_run_url=None):
     metadata = json.dumps({
         "run_id": run_id,
         "state": state,
@@ -258,13 +264,14 @@ def trigger_body(repo, sha, run_id=None, state="ready-to-label", workflow_state=
         "label_requested_at": label_requested_at.isoformat() if label_requested_at is not None else None,
     }, sort_keys=True)
     run_link = f"[{run_id}](https://github.com/{repo}/actions/runs/{run_id})" if run_id is not None else "not linked yet"
-    return (
+    body = (
         TRIGGER_MARKER.format(sha=sha)
         + f"\n<!-- inference-snaps-ci-orchestrator: state {metadata} -->"
         + f"\nWorkflow run: {run_link}."
         + (f"\nWorkflow state: {workflow_state}." if workflow_state is not None else "")
         + f"\nOrchestrator state: {state}."
     )
+    return with_orchestrator_logs(body, orchestrator_run_url)
 
 
 def evaluate_lab_run(run, jobs):
@@ -299,10 +306,11 @@ def evaluate_checks(check_runs, statuses):
 
 
 class Orchestrator:
-    def __init__(self, github, dry_run=True, merge_method="squash"):
+    def __init__(self, github, dry_run=True, merge_method="squash", *, orchestrator_run_url=None):
         self.github = github
         self.dry_run = dry_run
         self.merge_method = merge_method
+        self.orchestrator_run_url = orchestrator_run_url
 
     def run(self, repos):
         errors = 0
@@ -348,6 +356,9 @@ class Orchestrator:
                 return "label"
             trigger = self.record_trigger(repo, comments_path, sha, ref)
             self.minimize_outdated_comments(comments, sha, ref)
+        else:
+            # Refresh the log link even if polling doesn't change the comment's test status.
+            self.save_trigger_body(repo, trigger, with_orchestrator_logs(trigger.body, self.orchestrator_run_url))
 
         runs = self.github.get_all(
             f"/repos/{repo}/actions/workflows/pr-label.yaml/runs?head_sha={sha}&event=pull_request",
@@ -445,18 +456,24 @@ class Orchestrator:
         body = trigger_body(
             repo, trigger.sha, trigger.run_id, state, workflow_state,
             label_attempts=trigger.label_attempts, label_requested_at=trigger.label_requested_at,
+            orchestrator_run_url=self.orchestrator_run_url,
         )
+        self.save_trigger_body(repo, trigger, body)
+        trigger.state = state
+
+    def save_trigger_body(self, repo, trigger, body):
         if body != trigger.body and not self.dry_run:
             self.github.patch(
                 f"/repos/{repo}/issues/comments/{trigger.comment_id}", {"body": body},
             )
-        trigger.state = state
         trigger.body = body
 
     def record_trigger(self, repo, comments_path, sha, ref):
         log.info("%s: recording lab-test trigger for %s", ref, sha)
         try:
-            comment = self.github.post(comments_path, {"body": trigger_body(repo, sha)})
+            comment = self.github.post(comments_path, {
+                "body": trigger_body(repo, sha, orchestrator_run_url=self.orchestrator_run_url),
+            })
         except (urllib.error.URLError, TimeoutError) as error:
             if not uncertain_write(error):
                 raise
@@ -584,6 +601,16 @@ class Orchestrator:
         return "wait"
 
 
+def actions_run_url(env):
+    if env.get("GITHUB_ACTIONS") != "true":
+        return None
+    server, repo, run_id = (env.get(name) for name in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"))
+    if not server or not repo or not run_id:
+        log.warning("Missing GitHub Actions run metadata; omitting the orchestrator log link")
+        return None
+    return f"{server.rstrip('/')}/{repo}/actions/runs/{run_id}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--catalog-url", default=CATALOG_URL)
@@ -608,7 +635,9 @@ def main(argv=None):
 
     repos = args.repo or repos_from_catalog(fetch_catalog(args.catalog_url))
     log.info("Scanning %d repos%s", len(repos), " (dry run)" if args.dry_run else "")
-    errors = Orchestrator(GitHub(token), args.dry_run, args.merge_method).run(repos)
+    errors = Orchestrator(
+        GitHub(token), args.dry_run, args.merge_method, orchestrator_run_url=actions_run_url(os.environ),
+    ).run(repos)
     return 1 if errors else 0
 
 

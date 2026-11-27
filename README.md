@@ -38,7 +38,9 @@ The [Orchestrate](.github/workflows/orchestrate.yaml) workflow runs every 5 minu
 
 Comments show GitHub's raw **Workflow state** (for example, `queued`, `in_progress`,
 or `completed`) separately from the **Orchestrator state** (for example, `pending`,
-`waiting-for-checks`, or `merged`). States are refreshed on each poll.
+`waiting-for-checks`, or `merged`). States are refreshed on each poll. When running
+in GitHub Actions, the comment also links to the latest orchestrator run and its
+logs, separately from the lab workflow. Local runs omit the orchestrator log link.
 
 ### Setup
 
