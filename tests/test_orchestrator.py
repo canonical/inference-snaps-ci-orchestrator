@@ -2,6 +2,7 @@ import copy
 import os
 import unittest
 import urllib.error
+from datetime import datetime
 from unittest.mock import patch
 
 import orchestrator
@@ -10,6 +11,7 @@ from orchestrator import FAILED, PASSED, PENDING, Orchestrator
 LABELLED_AT = "2026-11-20T10:00:00Z"
 BEFORE = "2026-11-20T09:00:00Z"
 AFTER = "2026-11-20T11:00:00Z"
+POLL_AT = "2026-11-20T10:10:00Z"
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 REPO = "canonical/foo-snap"
@@ -40,6 +42,7 @@ OTHER_PATCH = """@@ -1,3 +1,3 @@ parts:
 def make_pr(number=1, author="renovate[bot]", title="Update dependency foo", labels=(), draft=False, sha=SHA):
     return {
         "number": number,
+        "state": "open",
         "title": title,
         "user": {"login": author},
         "draft": draft,
@@ -51,7 +54,10 @@ def make_pr(number=1, author="renovate[bot]", title="Update dependency foo", lab
 def marker(sha=SHA, at=LABELLED_AT, run_id=None, state="waiting-for-run", association="MEMBER"):
     return {
         "id": 10,
-        "body": orchestrator.trigger_body(REPO, sha, run_id, state),
+        "body": orchestrator.trigger_body(
+            REPO, sha, run_id, state,
+            label_attempts=1, label_requested_at=orchestrator.parse_time(at),
+        ),
         "created_at": at,
         "author_association": association,
         "user": {"type": "User"},
@@ -91,6 +97,7 @@ class FakeGitHub:
         self.reads = []
         self.fail_label = False
         self.merge_response = {"merged": True}
+        self.pr = make_pr()
 
     def get_all(self, path, key=None):
         self.reads.append(path)
@@ -100,6 +107,8 @@ class FakeGitHub:
             return self.files
         if path.endswith("/comments"):
             return self.comments
+        if path.endswith("/timeline"):
+            return []
         if "/actions/workflows/pr-label.yaml/runs?" in path:
             return [run for run in self.runs if run["head_sha"] in path]
         if path.endswith("/jobs"):
@@ -113,6 +122,8 @@ class FakeGitHub:
 
     def get(self, path):
         self.reads.append(path)
+        if path == f"/repos/{REPO}/pulls/{self.pr['number']}":
+            return self.pr
         if "/actions/runs/" in path:
             return copy.deepcopy(next(run for run in self.runs if path.endswith(f"/{run['id']}")))
         raise AssertionError(path)
@@ -334,8 +345,14 @@ class TestEvaluateChecks(unittest.TestCase):
 
 
 class TestProcess(unittest.TestCase):
+    def setUp(self):
+        clock = patch.object(orchestrator, "datetime", wraps=datetime)
+        self.addCleanup(clock.stop)
+        clock.start().now.return_value = orchestrator.parse_time(POLL_AT)
+
     def process(self, github, pr=None, dry_run=False):
-        return Orchestrator(github, dry_run=dry_run).process(REPO, pr or make_pr())
+        github.pr = pr or make_pr()
+        return Orchestrator(github, dry_run=dry_run).process(REPO, github.pr)
 
     def test_skips_other_authors_drafts_and_titles_without_changes(self):
         for pr, expected in [
@@ -350,11 +367,19 @@ class TestProcess(unittest.TestCase):
     def test_records_attempt_before_adding_label(self):
         github = FakeGitHub()
         self.assertEqual(self.process(github), "label")
+        requested_at = orchestrator.parse_time(POLL_AT)
+        comment_path = f"/repos/{REPO}/issues/comments/20"
         self.assertEqual(
             github.calls,
             [
                 ("POST", f"/repos/{REPO}/issues/1/comments", {"body": orchestrator.trigger_body(REPO, SHA)}),
+                ("PATCH", comment_path, {"body": orchestrator.trigger_body(
+                    REPO, SHA, state="label-requested", label_attempts=1, label_requested_at=requested_at,
+                )}),
                 ("POST", f"/repos/{REPO}/issues/1/labels", {"labels": ["trigger-tests"]}),
+                ("PATCH", comment_path, {"body": orchestrator.trigger_body(
+                    REPO, SHA, state="waiting-for-run", label_attempts=1, label_requested_at=requested_at,
+                )}),
             ],
         )
 
@@ -369,7 +394,7 @@ class TestProcess(unittest.TestCase):
         self.assertFalse(any(call[0] == "POST" for call in github.calls))
         self.assertEqual(orchestrator.find_trigger(github.comments, SHA).state, "merged")
 
-    def test_label_failure_is_not_retried(self):
+    def test_uncertain_label_failure_is_not_retried_before_grace_period(self):
         github = FakeGitHub()
         github.fail_label = True
         with self.assertRaises(urllib.error.URLError):
@@ -380,17 +405,18 @@ class TestProcess(unittest.TestCase):
 
     def test_new_sha_gets_one_attempt_and_old_sha_is_remembered(self):
         github = FakeGitHub(comments=[marker()])
-        self.assertEqual(self.process(github, make_pr(sha=OTHER_SHA, labels=["trigger-tests"])), "label")
-        self.assertEqual([call[0] for call in github.calls], ["POST", "DELETE", "POST"])
+        self.assertEqual(self.process(github, make_pr(sha=OTHER_SHA)), "label")
+        self.assertEqual([call[0] for call in github.calls], ["POST", "PATCH", "POST", "PATCH"])
         github.calls.clear()
         self.assertEqual(self.process(github, make_pr(sha=OTHER_SHA)), "wait")
         self.assertEqual(self.process(github), "wait")
         self.assertEqual(github.calls, [])
 
-    def test_existing_label_is_toggled_for_first_attempt(self):
+    def test_existing_label_is_not_toggled_for_first_attempt(self):
         github = FakeGitHub()
-        self.process(github, make_pr(labels=["trigger-tests"]))
-        self.assertEqual([call[0] for call in github.calls], ["POST", "DELETE", "POST"])
+        self.assertEqual(self.process(github, make_pr(labels=["trigger-tests"])), "wait")
+        self.assertEqual([call[0] for call in github.calls], ["POST"])
+        self.assertEqual(orchestrator.find_trigger(github.comments, SHA).state, "ready-to-label")
 
     def test_links_and_updates_same_comment_then_merges_pinned_sha(self):
         github = FakeGitHub(comments=[marker()], runs=[workflow_run()])
@@ -440,7 +466,9 @@ class TestProcess(unittest.TestCase):
         self.assertEqual(github.calls, [])
 
     def test_waits_for_jobs_to_appear(self):
-        github = FakeGitHub(comments=[marker()], runs=[workflow_run(status="queued")], jobs={})
+        github = FakeGitHub(
+            comments=[marker(state="label-requested")], runs=[workflow_run(status="queued")], jobs={},
+        )
         self.assertEqual(self.process(github), "wait")
         self.assertEqual(github.calls, [])
 
